@@ -26,3 +26,12 @@ position: [0]
 velocity: [120]
 effort: [0]" -1
 ```
+
+## Angle range
+### servo 1
+- -100 -> down
+-  0   -> horizontal
+-  100 -> up
+### servo 3
+- -135 -> extended
+-  0   -> bent inward
