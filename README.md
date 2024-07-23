@@ -34,16 +34,16 @@ $ rostopic pub /umoru_rarm_controller/joint_state sensor_msgs/JointState "header
   stamp: {secs: 0, nsecs: 0}
   frame_id: ''
 name: ['joint_yaw']
-position: [0]
-velocity: [120]
+position: [-120]
+velocity: [255]
 effort: [0]" -1
 ```
 
 ## Angle range
-### servo 1
-- -100 -> down
+### servo 1 (pitch)
+- -100 -> up
 -  0   -> horizontal
--  100 -> up
-### servo 3
+-  100 -> down
+### servo 3 (yaw)
 - -135 -> extended
--  0   -> bent inward
+-  -40   -> bent inward
