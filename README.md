@@ -26,24 +26,22 @@ $ roslaunch umoru_arm umoru_arm.launch arm:="rarm"
 
 ## master PC
 1. Start roscore
-2. Publish ros messages for each arm
-- Velocity (actually represents duration) ranges from 1 to 255.
+2. Publish ros messages via MotionClient
 ```
-$ rostopic pub /umoru_rarm_controller/joint_state sensor_msgs/JointState "header:
-  seq: 0
-  stamp: {secs: 0, nsecs: 0}
-  frame_id: ''
-name: ['joint_yaw']
-position: [-120]
-velocity: [255]
-effort: [0]" -1
-```
+import rospy
+from umoru_arm import MotionClient
 
+rospy.init_node("test")
+client = MotionClient("rarm")
+
+client.reset_pose()
+client.init_pose()
+```
 ## Angle range
 ### servo 1 (pitch)
-- -100 -> up
+- -90 -> up
 -  0   -> horizontal
--  100 -> down
+-  90 -> down
 ### servo 3 (yaw)
 - -135 -> extended
 -  -40   -> bent inward
