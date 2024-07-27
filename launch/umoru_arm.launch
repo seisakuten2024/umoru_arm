@@ -1,9 +1,11 @@
 <launch>
   <arg name="arm" default="rarm"/>
-
+  <arg name="device" default="" />
   <node
       name="umoru_$(arg arm)_controller"
       pkg="umoru_arm"
       type="umoru_arm_controller.py"
-      output="screen"/>
+      output="screen">
+    <param name="device" type="str" value="$(arg device)" />
+  </node>
 </launch>

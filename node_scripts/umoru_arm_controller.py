@@ -9,8 +9,8 @@ class UmoruArmController():
     def __init__(self):
         self.joint_name_to_id = {'joint_pitch':1, 'joint_yaw':3}
         self.interface = ARMH7Interface()
-        device = rospy.get_param('~device', None)
-        if device is None:
+        device = rospy.get_param('~device', '')
+        if device == '':
             self.interface.auto_open()
         else:
             self.interface.open(device)
