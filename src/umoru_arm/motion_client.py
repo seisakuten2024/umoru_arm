@@ -17,6 +17,8 @@ class MotionClient(object):
         msg.velocity = velocity
         if arm == "rarm":
             self.rarm_pub.publish(msg)
+        if arm == "larm":
+            self.larm_pub.publish(msg)
 
 
     def reset_pose(self, velocity=300):
@@ -26,6 +28,9 @@ class MotionClient(object):
         if self.mode == "both" or self.mode == "rarm":
             msg.position = [0, -135]
             self.rarm_pub.publish(msg)
+        if self.mode == "both" or self.mode == "larm":
+            msg.position = [0, 135]
+            self.larm_pub.publish(msg)
 
 
     def init_pose(self, velocity=300):
@@ -35,6 +40,9 @@ class MotionClient(object):
         if self.mode == "both" or self.mode == "rarm":
             msg.position = [90, -135]
             self.rarm_pub.publish(msg)
+        if self.mode == "both" or self.mode == "larm":
+            msg.position = [-90, 135]
+            self.larm_pub.publish(msg)
 
 
     def hug(self, velocity=300):
@@ -44,6 +52,9 @@ class MotionClient(object):
         if self.mode == "both" or self.mode == "rarm":
             msg.position = [-50]
             self.rarm_pub.publish(msg)
+        if self.mode == "both" or self.mode == "larm":
+            msg.position = [50]
+            self.larm_pub.publish(msg)
 
 
     def extend(self, velocity=300):
@@ -53,6 +64,9 @@ class MotionClient(object):
         if self.mode == "both" or self.mode == "rarm":
             msg.position = [-135]
             self.rarm_pub.publish(msg)
+        if self.mode == "both" or self.mode == "larm":
+            msg.position = [135]
+            self.larm_pub.publish(msg)
 
 
     def raise_arm(self, arm, velocity=300):
@@ -62,5 +76,8 @@ class MotionClient(object):
         if arm == "both" or arm == "rarm":
             msg.position = [-90]
             self.rarm_pub.publish(msg)
+        if arm == "both" or arm == "larm":
+            msg.position = [90]
+            self.larm_pub.publish(msg)
 
 
