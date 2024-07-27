@@ -4,5 +4,6 @@
   <node
       name="umoru_$(arg arm)_controller"
       pkg="umoru_arm"
-      type="umoru_arm_controller.py"/>
+      type="umoru_arm_controller.py"
+      output="screen"/>
 </launch>

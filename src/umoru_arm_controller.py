@@ -9,11 +9,17 @@ class UmoruArmController():
     def __init__(self):
         self.joint_name_to_id = {'joint_pitch':1, 'joint_yaw':3}
         self.interface = ARMH7Interface()
-        self.interface.auto_open()
+        device = rospy.get_param('~device', None)
+        if device is None:
+            self.interface.auto_open()
+        else:
+            self.interface.open(device)
 
         self.sub = rospy.Subscriber('~joint_state',
             JointState, queue_size=1,
             callback=self.callback)
+
+        rospy.loginfo("id: {}".format(self.interface.search_servo_ids()))
 
     def callback(self, msg):
         servo_ids = []
