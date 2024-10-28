@@ -31,8 +31,8 @@ class UmoruArmController():
         self.max_pressures = {}
         for idx in self.air_board_ids:
             self.calibrate_sensor(idx)
-        self.refill_lower_threshold = 0.08
-        self.refill_upper_threshold = 0.5
+        self.refill_lower_threshold = -2.8
+        self.refill_upper_threshold = 1.2
         rospy.loginfo("servo id: {}".format(self.interface.search_servo_ids()))
         rospy.loginfo("air board id: {}".format(self.air_board_ids))
 
@@ -92,7 +92,7 @@ class UmoruArmController():
         for idx in self.air_board_ids:
             try:
                 key = f'{idx}'
-                if key not in self._pressure_publisher_dict:
+                if key not in self._scaled_pressure_publisher_dict:
                     self._scaled_pressure_publisher_dict[key] = rospy.Publisher(
                         '/scaled_pressure/'+key, std_msgs.msg.Float32,
                         queue_size=1)
@@ -105,7 +105,7 @@ class UmoruArmController():
                     self._scaled_pressure_publisher_dict[key].publish(
                         std_msgs.msg.Float32(data=scaled_pressure))
                     if self.control_pressure:
-                        if scaled_pressure < self.refill_lower_threshold:
+                        if scaled_pressure > -8 and scaled_pressure < self.refill_lower_threshold:
                             self.refill(idx, self.refill_upper_threshold)
             except serial.serialutil.SerialException as e:
                 rospy.logerr('[publish_pressure] {}'.format(str(e)))
@@ -134,39 +134,40 @@ class UmoruArmController():
             return None
 
     def scaled_pressure(self, idx):
-        # Get the current pressure and scale it using min and max pressures
-        current_pressure = self.average_pressure(idx)
+        return self.average_pressure(idx) - self.max_pressures[idx]
+        # # Get the current pressure and scale it using min and max pressures
+        # current_pressure = self.average_pressure(idx)
 
-        if idx in self.min_pressures and idx in self.max_pressures:
-            min_pressure = self.min_pressures[idx]
-            max_pressure = self.max_pressures[idx]
+        # if idx in self.min_pressures and idx in self.max_pressures:
+        #     min_pressure = self.min_pressures[idx]
+        #     max_pressure = self.max_pressures[idx]
 
-            if max_pressure > min_pressure:  # Avoid division by zero
-                scaled_pressure = (current_pressure - min_pressure) / (max_pressure - min_pressure)
-                return scaled_pressure
-            else:
-                rospy.logwarn(f"[get_scaled_pressure] Invalid calibration range for sensor {idx}")
-                return None
-        else:
-            # rospy.logwarn(f"[get_scaled_pressure] Calibration data not found for sensor {idx}")
-            return None
+        #     if max_pressure > min_pressure:  # Avoid division by zero
+        #         scaled_pressure = (current_pressure - min_pressure) / (max_pressure - min_pressure)
+        #         return scaled_pressure
+        #     else:
+        #         rospy.logwarn(f"[get_scaled_pressure] Invalid calibration range for sensor {idx}")
+        #         return None
+        # else:
+        #     # rospy.logwarn(f"[get_scaled_pressure] Calibration data not found for sensor {idx}")
+        #     return None
 
     def calibrate_sensor(self, idx):
         rospy.loginfo(f"[calibrate_sensor] id:{idx}")
-        # Step 1: Remove air to reach atmospheric pressure
-        self.start_remove_air(idx)
-        input("Press Enter to stop removing air...")
-        self.stop_remove_air(idx)
+        # # Step 1: Remove air to reach atmospheric pressure
+        # self.start_remove_air(idx)
+        # input("Press Enter to stop removing air...")
+        # self.stop_remove_air(idx)
 
-        # Save the minimum pressure reading as atmospheric pressure
-        for i in range(10):
-            self.read_pressure_sensor(idx)
-        min_pressure = self.average_pressure(idx)
-        if min_pressure > 40:
-            rospy.logwarn(f"Invalid calibration range for sensor {idx}")
-            return
-        self.min_pressures[idx] = min_pressure
-        rospy.loginfo(f"[calibrate_sensor] Sensor {idx} min pressure (atmospheric): {min_pressure}")
+        # # Save the minimum pressure reading as atmospheric pressure
+        # for i in range(10):
+        #     self.read_pressure_sensor(idx)
+        # min_pressure = self.average_pressure(idx)
+        # if min_pressure > 40:
+        #     rospy.logwarn(f"Invalid calibration range for sensor {idx}")
+        #     return
+        # self.min_pressures[idx] = min_pressure
+        # rospy.loginfo(f"[calibrate_sensor] Sensor {idx} min pressure (atmospheric): {min_pressure}")
 
         # Step 2: Add air for 8 seconds to reach maximum pressure
         self.start_add_air(idx)
@@ -177,9 +178,9 @@ class UmoruArmController():
         for i in range(10):
             self.read_pressure_sensor(idx)
         max_pressure = self.average_pressure(idx)
-        if max_pressure <= min_pressure:
-            rospy.logwarn(f"Invalid calibration range for sensor {idx}")
-            return
+        # if max_pressure <= min_pressure:
+        #     rospy.logwarn(f"Invalid calibration range for sensor {idx}")
+        #     return
         self.max_pressures[idx] = max_pressure
         rospy.loginfo(f"[calibrate_sensor] Sensor {idx} max pressure: {max_pressure}")
 
