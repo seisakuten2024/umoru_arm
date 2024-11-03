@@ -24,7 +24,7 @@ $ cd ~/ros/seisakuten_ws/src/umoru_arm
 $ sudo ln -s 90-umoru.rules /etc/udev/rules.d/
 $ sudo udevadm control --reload-rules && udevadm trigger
 ```
-4. Run arm controller  
+3. Run arm controller  
 ```
 $ rossetip
 $ source ~/ros/seisakuten_ws/devel/setup.bash
