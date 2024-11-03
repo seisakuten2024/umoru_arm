@@ -1,0 +1,15 @@
+<launch>
+  <arg name="device" default="/dev/umoru_larm" />
+  <arg name="namespace" default="larm" />
+  <arg name="urdf_path" default="" />
+  <arg name="servo_config_path" default="$(find umoru_arm)/config/larm_servo_config.yaml" />
+  
+  <include file="$(find kxr_controller)/launch/kxr_controller.launch" >
+    <arg name="servo_config_path" value="$(arg servo_config_path)" />
+    <arg name="device" value="$(arg device)" />
+    <arg name="publish_imu" value="false" />
+    <arg name="namespace" value="$(arg namespace)" />
+    <arg name="urdf_path" value="" />
+  </include>
+  
+</launch>
