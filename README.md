@@ -1,30 +1,8 @@
 # System configuration
 ## communication
-master PC -(Wi-Fi) - (larm/rarm) radxa - (UART) - kondoh7 - (ICS) - servo1 (pitch), servo3 (yaw)
-## power supply
-Lipo battery (7.4V) - kondoh7 - servo1, 3
+master PC -(Wi-Fi) - (larm/rarm) USB-Serial converter - (UART) - kondoh7 - (ICS) - servo1 (pitch), servo3 (yaw)
 
 # Software setup
-## A. Arm controller
-### option 1: radxa for each arm
-1. from pc, `ssh USER@IP_ADRESS`
-2. Setup environment (first time) 
-```
-$ mkdir -p ~/ros/seisakuten_ws/src
-$ cd ~/ros/seisakuten_ws
-$ catkin init
-$ cd ~/ros/seisakuten_ws/src
-$ git clone https://github.com/nakane11/umoru_arm
-$ catkin build
-```
-3. Connect to master PC  
-`rossetmaster MASTER_IP_ADDRESS`
-4. Run arm controller  
-```
-$ source ~/ros/seisakuten_ws/devel/setup.bash
-$ roslaunch umoru_arm umoru_arm.launch arm:="rarm"
-```
-### option 2: master PC
 1. Setup environment (first time) 
 ```
 $ mkdir -p ~/ros/seisakuten_ws/src
@@ -33,16 +11,31 @@ $ catkin init
 $ cd ~/ros/seisakuten_ws/src
 $ git clone https://github.com/nakane11/umoru_arm
 $ catkin build
+
+$ cd ~/ros/seisakuten_ws/src
+$ git clone https://github.com/nakane11/rcb4.git -b umoru
+$ cd rcb4
+$ pip3 -e .
+$ catkin b kxr_controller --cmake-args -DUSE_VIRTUALENV=OFF
 ```
-2. Run arm controller for each arm
+2. Add udev rules
 ```
+$ cd ~/ros/seisakuten_ws/src/umoru_arm
+$ sudo ln -s 90-umoru.rules /etc/udev/rules.d/
+$ sudo udevadm control --reload-rules && udevadm trigger
+```
+4. Run arm controller  
+```
+$ rossetip
 $ source ~/ros/seisakuten_ws/devel/setup.bash
-$ roslaunch umoru_arm umoru_arm.launch arm:="rarm" device:=/dev/ttyUSB0
+$ roslaunch umoru_arm umoru_larm.launch
 ```
 ```
+$ rossetip
 $ source ~/ros/seisakuten_ws/devel/setup.bash
-$ roslaunch umoru_arm umoru_arm.launch arm:="larm" device:=/dev/ttyUSB1
+$ roslaunch umoru_arm umoru_rarm.launch
 ```
+
 ## B. Client (master PC)
 1. Start `roscore`
 2. Publish ros messages via MotionClient
