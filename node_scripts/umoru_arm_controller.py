@@ -1,40 +1,732 @@
 #!/usr/bin/env python3
 
 from collections import deque
+import os
+import os.path as osp
+import shlex
+import subprocess
+import sys
+import tempfile
+import threading
+import xml.etree.ElementTree as ET
+
+import actionlib
+from actionlib_msgs.msg import GoalID
+from control_msgs.msg import FollowJointTrajectoryAction
+from control_msgs.msg import FollowJointTrajectoryGoal
+from dynamic_reconfigure.server import Server
+import geometry_msgs.msg
+from kxr_controller.cfg import KXRParameteresConfig as Config
+from kxr_controller.msg import AdjustAngleVectorAction
+from kxr_controller.msg import AdjustAngleVectorResult
+from kxr_controller.msg import PressureControl
+from kxr_controller.msg import PressureControlAction
+from kxr_controller.msg import PressureControlResult
+from kxr_controller.msg import ServoOnOff
+from kxr_controller.msg import ServoOnOffAction
+from kxr_controller.msg import ServoOnOffResult
+from kxr_controller.msg import ServoState
+from kxr_controller.msg import ServoStateArray
+from kxr_controller.msg import Stretch
+from kxr_controller.msg import StretchAction
+from kxr_controller.msg import StretchResult
+from kxr_controller.serial import serial_call_with_retry
 import numpy as np
 import rospy
-from rcb4.armh7interface import ARMH7Interface
+import sensor_msgs.msg
 from sensor_msgs.msg import JointState
 import serial
+from skrobot.model import RobotModel
+from skrobot.utils.urdf import no_mesh_load_mode
 import std_msgs.msg
-import time
+from trajectory_msgs.msg import JointTrajectoryPoint
+import yaml
 
-class UmoruArmController():
-    def __init__(self):
-        self.joint_name_to_id = {'joint_pitch':1, 'joint_yaw':3}
-        self.interface = ARMH7Interface()
-        device = rospy.get_param('~device', '')
-        if device == '':
-            self.interface.auto_open()
+from rcb4.armh7interface import ARMH7Interface
+from rcb4.rcb4interface import RCB4Interface
+from rcb4.rcb4interface import ServoOnOffValues
+from umoru_arm.srv import SensorCalib, SensorCalibResponse
+
+np.set_printoptions(precision=0, suppress=True)
+
+
+def load_yaml(file_path, Loader=yaml.SafeLoader):
+    """Load a YAML file into a Python dict.
+
+    Parameters
+    ----------
+    file_path : str or pathlib.PosixPath
+        The path to the YAML file.
+
+    Returns
+    -------
+    data : dict
+        A dict with the loaded yaml data.
+    """
+    if not osp.exists(str(file_path)):
+        raise OSError(f"{file_path!s} not exists")
+    with open(osp.expanduser(file_path)) as f:
+        data = yaml.load(f, Loader=Loader)
+    data = data["joint_name_to_servo_id"]
+    joint_name_to_id = {}
+    for name in data:
+        if isinstance(data[name], int):
+            joint_name_to_id[name] = data[name]
         else:
-            self.interface.open(device)
+            joint_name_to_id[name] = data[name]["id"]
+    return joint_name_to_id, data
 
-        self.sub = rospy.Subscriber('~joint_state',
-            JointState, queue_size=1,
-            callback=self.callback)
-        self.control_pressure = rospy.get_param('~control_pressure', True)
+
+def make_urdf_file(joint_name_to_id):
+    robot = ET.Element(
+        "robot", {"name": "dummy_robot", "xmlns:xi": "http://www.w3.org/2001/XInclude"}
+    )
+
+    ET.SubElement(robot, "link", name="base_link")
+    previous_link_name = "base_link"
+
+    for joint_name in joint_name_to_id.keys():
+        link_name = f"{joint_name}_link"
+        ET.SubElement(robot, "link", name=link_name)
+
+        joint = ET.SubElement(robot, "joint", name=joint_name, type="continuous")
+        ET.SubElement(joint, "parent", link=previous_link_name)
+        ET.SubElement(joint, "child", link=link_name)
+        ET.SubElement(joint, "limit", velocity="7.47998", effort="0.656248")
+
+        previous_link_name = link_name
+
+    tmp_urdf_file = tempfile.mktemp(suffix=".urdf")
+    tree = ET.ElementTree(robot)
+    tree.write(tmp_urdf_file, encoding="utf-8", xml_declaration=True)
+    return tmp_urdf_file
+
+
+def run_robot_state_publisher(namespace=None):
+    command = f'/opt/ros/{os.environ["ROS_DISTRO"]}/bin/rosrun'
+    command += " robot_state_publisher robot_state_publisher"
+    if namespace is not None:
+        command += f" _tf_prefix:={namespace}"
+    command = shlex.split(command)
+    process = subprocess.Popen(command)
+    return process
+
+
+def run_kxr_controller(namespace=None):
+    command = f'/opt/ros/{os.environ["ROS_DISTRO"]}/bin/rosrun'
+    command += " kxr_controller kxr_controller"
+    command += " __name=:kxr_controller"
+    command = shlex.split(command)
+    process = subprocess.Popen(command)
+    return process
+
+
+def set_initial_position(positions, namespace=None):
+    rospy.set_param(namespace + "/initial_position", positions)
+
+
+def set_fullbody_controller(joint_names):
+    controller_yaml_dict = {
+        "type": "position_controllers/JointTrajectoryController",
+        "joints": joint_names,
+    }
+    rospy.set_param("fullbody_controller", controller_yaml_dict)
+
+
+def set_joint_state_controler():
+    rospy.set_param(
+        "joint_state_controller",
+        {"type": "joint_state_controller/JointStateController", "publish_rate": 10},
+    )
+
+
+def set_robot_description(urdf_path, param_name="robot_description"):
+    with open(urdf_path) as f:
+        rospy.set_param(param_name, f.read())
+
+
+class RCB4ROSBridge:
+    def __init__(self):
+        self._update_temperature_limit = False
+        self._update_current_limit = False
+
+        self._during_servo_off = False
+        # Set up configuration paths and parameters
+        self.setup_paths_and_params()
+
+        # Set up URDF and Robot Model
+        self.robot_model, self.joint_names = self.setup_urdf_and_model()
+        while not rospy.is_shutdown():
+            ret = self.setup_interface_and_servo_parameters()
+            if ret is True:
+                break
+        # Set up ROS parameters and controllers
+        self.setup_ros_parameters()
+        self.run_ros_robot_controllers()
+
+        self.setup_publishers_and_servers()
+        self.control_positive_pressure = rospy.get_param('~control_positive_pressure', True)
         self.air_board_ids = self.interface.search_air_board_ids() \
                                                    .tolist()
+        self.pump_id = min(self.air_board_ids)
+        self.calibrate_dict = {}
+        for idx in self.air_board_ids:
+            self.calibrate_dict[f"{idx}"] = False
+        self._pressure_publisher_dict = {}
         self._scaled_pressure_publisher_dict = {}
         self.recent_pressures = {}
-        self.min_pressures = {}
         self.max_pressures = {}
-        for idx in self.air_board_ids:
-            self.calibrate_sensor(idx)
         self.refill_lower_threshold = -2.8
         self.refill_upper_threshold = 1.2
+        self.calib_service = rospy.Service(self.base_namespace+'/calibrate_sensor', SensorCalib, self.calibrate_sensor)
         rospy.loginfo("servo id: {}".format(self.interface.search_servo_ids()))
         rospy.loginfo("air board id: {}".format(self.air_board_ids))
+
+        self.subscribe()
+        rospy.loginfo("RCB4 ROS Bridge initialization completed.")
+
+    def setup_paths_and_params(self):
+        self.proc_controller_spawner = None
+        self.proc_robot_state_publisher = None
+        self.proc_kxr_controller = None
+        servo_config_path = rospy.get_param("~servo_config_path")
+        self.joint_name_to_id, self.servo_infos = load_yaml(servo_config_path)
+        self.urdf_path = rospy.get_param("~urdf_path", None)
+        self.use_rcb4 = rospy.get_param("~use_rcb4", False)
+        self.control_pressure = rospy.get_param("~control_pressure", True)
+        self.read_temperature = rospy.get_param("~read_temperature", True) and not self.use_rcb4
+        self.read_current = rospy.get_param("~read_current", True) and not self.use_rcb4
+        self.base_namespace = self.get_base_namespace()
+
+    def setup_urdf_and_model(self):
+        robot_model = RobotModel()
+        rospy.loginfo(f"[setup_urdf_and_model] Loading URDF File. {self.urdf_path}")
+        if self.urdf_path is None:
+            self.urdf_path = make_urdf_file(self.joint_name_to_id)
+            rospy.loginfo("Use temporary URDF")
+        with open(self.urdf_path) as f:
+            with no_mesh_load_mode():
+                robot_model.load_urdf_file(f)
+        joint_list = [
+            j for j in robot_model.joint_list if j.__class__.__name__ != "FixedJoint"
+        ]
+        joint_names = [j.name for j in joint_list]
+        set_robot_description(
+            self.urdf_path, param_name=self.base_namespace + "/robot_description"
+        )
+        if self.urdf_path is None:
+            os.remove(self.urdf_path)
+        return robot_model, joint_names
+
+    def setup_ros_parameters(self):
+        """Configure joint state and full body controllers."""
+        set_joint_state_controler()
+        self.set_fullbody_controller()
+
+    def setup_publishers_and_servers(self):
+        """Set up ROS publishers and action servers."""
+        self.current_joint_states_pub = rospy.Publisher(
+            self.base_namespace + "/current_joint_states", JointState, queue_size=1
+        )
+
+        self.servo_states_pub = rospy.Publisher(
+            self.base_namespace + "/servo_states", ServoStateArray, queue_size=1
+        )
+
+        # Publish servo state like joint_trajectory_controller
+        # https://wiki.ros.org/joint_trajectory_controller#Published_Topics
+        self.servo_on_off_pub = rospy.Publisher(
+            self.base_namespace
+            + "/fullbody_controller/servo_on_off_real_interface/state",
+            ServoOnOff,
+            queue_size=1,
+        )
+
+        self.cancel_motion_pub = rospy.Publisher(
+            self.base_namespace
+            + "/fullbody_controller/follow_joint_trajectory"
+            + "/cancel",
+            GoalID,
+            queue_size=1,
+        )
+
+        # Action servers for servo control
+        self.setup_action_servers_and_clients()
+        self.srv = Server(Config, self.config_callback)
+
+    def setup_action_servers_and_clients(self):
+        """Set up action servers for controlling servos and pressure."""
+
+        # Servo on/off action server
+        self.servo_on_off_server = actionlib.SimpleActionServer(
+            self.base_namespace + "/fullbody_controller/servo_on_off_real_interface",
+            ServoOnOffAction,
+            execute_cb=self.servo_on_off_callback,
+            auto_start=False,
+        )
+        # Avoid 'rospy.exceptions.ROSException: publish() to a closed topic'
+        rospy.sleep(0.1)
+        self.servo_on_off_server.start()
+
+        self.traj_action_client = actionlib.SimpleActionClient(
+            self.base_namespace + "/fullbody_controller/follow_joint_trajectory",
+            FollowJointTrajectoryAction,
+        )
+        self.traj_action_client.wait_for_server()
+
+        # Adjust angle vector action server
+        self.adjust_angle_vector_server = actionlib.SimpleActionServer(
+            self.base_namespace + "/fullbody_controller/adjust_angle_vector_interface",
+            AdjustAngleVectorAction,
+            execute_cb=self.adjust_angle_vector_callback,
+            auto_start=False,
+        )
+        # Avoid 'rospy.exceptions.ROSException: publish() to a closed topic'
+        rospy.sleep(0.1)
+        self.adjust_angle_vector_server.start()
+
+        # Additional action servers based on configuration
+        if not self.use_rcb4:
+            self.setup_stretch_and_pressure_control_servers()
+
+    def setup_stretch_and_pressure_control_servers(self):
+        """Configure stretch and pressure control action servers if enabled."""
+        self.stretch_server = actionlib.SimpleActionServer(
+            self.base_namespace + "/fullbody_controller/stretch_interface",
+            StretchAction,
+            execute_cb=self.stretch_callback,
+            auto_start=False,
+        )
+        rospy.sleep(0.1)
+        self.stretch_server.start()
+
+        self.stretch_publisher = rospy.Publisher(
+            self.base_namespace + "/fullbody_controller/stretch",
+            Stretch,
+            queue_size=1,
+            latch=True,
+        )
+        rospy.sleep(0.1)
+        while not rospy.is_shutdown():
+            rospy.loginfo("Try to publish stretch values.")
+            ret = self.publish_stretch()
+            if ret is True:
+                break
+            rospy.sleep(0.1)
+
+        if self.control_pressure:
+            # self.pressure_control_server = actionlib.SimpleActionServer(
+            #     self.base_namespace + "/fullbody_controller/pressure_control_interface",
+            #     PressureControlAction,
+            #     execute_cb=self.pressure_control_callback,
+            #     auto_start=False,
+            # )
+            # rospy.sleep(0.1)
+            # self.pressure_control_server.start()
+
+            # self.pressure_control_pub = rospy.Publisher(
+            #     self.base_namespace
+            #     + "/fullbody_controller/pressure_control_interface"
+            #     + "/state",
+            #     PressureControl,
+            #     queue_size=1,
+            # )
+
+            rospy.set_param(self.base_namespace + "/air_board_ids", self.air_board_ids)
+            # self.pressure_control_state = {}
+            # for idx in self.air_board_ids:
+            #     self.pressure_control_state[f"{idx}"] = {}
+            #     self.pressure_control_state[f"{idx}"]["start_pressure"] = 0
+            #     self.pressure_control_state[f"{idx}"]["stop_pressure"] = 0
+            #     self.pressure_control_state[f"{idx}"]["release"] = True
+            # self._pressure_publisher_dict = {}
+            # self._avg_pressure_publisher_dict = {}
+            # # Record 1 seconds pressure data.
+            # hz = rospy.get_param(self.base_namespace + "/control_loop_rate", 20)
+            # self.recent_pressures = deque([], maxlen=1 * int(hz))
+
+    def setup_interface_and_servo_parameters(self):
+        self.interface = self.setup_interface()
+
+        def log_error_and_close_interface(function_name):
+            msg = f"Failed to {function_name}. "
+            msg += "Control board is switch off or cable is disconnected?"
+            rospy.logerr(msg)
+            self.interface.close()
+            return False
+
+        if self.read_current:
+            serial_call_with_retry(self.interface.switch_reading_servo_current, enable=True, max_retries=3)
+        if self.read_temperature:
+            serial_call_with_retry(self.interface.switch_reading_servo_temperature, enable=True, max_retries=3)
+
+        wheel_servo_sorted_ids = []
+        trim_vector_servo_ids = []
+        trim_vector_offset = []
+        for _, info in self.servo_infos.items():
+            if isinstance(info, int):
+                continue
+            servo_id = info["id"]
+            direction = info.get("direction", 1)
+            offset = info.get("offset", 0)
+            if "type" in info and info["type"] == "continuous":
+                wheel_servo_sorted_ids.append(servo_id)
+            idx = self.interface.servo_id_to_index(servo_id)
+            if idx is None:
+                continue
+            self.interface._joint_to_actuator_matrix[idx, idx] = (
+                direction * self.interface._joint_to_actuator_matrix[idx, idx]
+            )
+            trim_vector_servo_ids.append(servo_id)
+            trim_vector_offset.append(direction * offset)
+        if self.interface.__class__.__name__ != "RCB4Interface":
+            if len(trim_vector_offset) > 0:
+                ret = serial_call_with_retry(
+                    self.interface.trim_vector,
+                    trim_vector_offset,
+                    trim_vector_servo_ids,
+                    max_retries=10,
+                )
+                if ret is None:
+                    return log_error_and_close_interface("set trim_vector")
+        if self.interface.wheel_servo_sorted_ids is None:
+            self.interface.wheel_servo_sorted_ids = wheel_servo_sorted_ids
+
+        # set servo ids to rosparam
+        servo_ids = self.get_ids(type="servo")
+        if servo_ids is None:
+            return log_error_and_close_interface("get initial servo ids")
+        rospy.set_param(self.base_namespace + "/servo_ids", servo_ids)
+        ret = self.set_initial_positions()
+        if ret is False:
+            return log_error_and_close_interface("get initial angle vector")
+        if self.control_pressure:
+            self.air_board_ids = self.get_ids(type="air_board")
+            if self.air_board_ids is None:
+                return log_error_and_close_interface("get air board ids")
+        return True
+
+    def run_ros_robot_controllers(self):
+        self.proc_controller_spawner = subprocess.Popen(
+            [
+                f'/opt/ros/{os.environ["ROS_DISTRO"]}/bin/rosrun',
+                "controller_manager",
+                "spawner",
+            ]
+            + ["joint_state_controller", "fullbody_controller"]
+        )
+        self.proc_robot_state_publisher = run_robot_state_publisher(self.base_namespace)
+        self.proc_kxr_controller = run_kxr_controller(namespace=self.base_namespace)
+
+    def setup_interface(self):
+        rospy.loginfo("Try to connect servo control boards.")
+        while not rospy.is_shutdown():
+            rospy.loginfo("Waiting for the port to become available")
+            try:
+                if rospy.get_param("~device", None):
+                    return ARMH7Interface.from_port(rospy.get_param("~device"))
+                if self.use_rcb4:
+                    interface = RCB4Interface()
+                    ret = interface.auto_open()
+                    if ret is True:
+                        return interface
+                interface = ARMH7Interface()
+                ret = interface.auto_open()
+                if ret is True:
+                    return interface
+            except serial.SerialException as e:
+                rospy.logerr(f"Waiting for the port to become available: {e}")
+            rospy.sleep(1.0)
+        rospy.logerr("Could not open port!")
+        sys.exit(1)
+
+    def get_base_namespace(self):
+        """Return the clean namespace for the node."""
+        full_namespace = rospy.get_namespace()
+        last_slash_pos = full_namespace.rfind("/")
+        return full_namespace[:last_slash_pos] if last_slash_pos != 0 else ""
+
+    def __del__(self):
+        self.unsubscribe()
+        if self.proc_controller_spawner:
+            self.proc_controller_spawner.kill()
+        if self.proc_robot_state_publisher:
+            self.proc_robot_state_publisher.kill()
+        if self.proc_kxr_controller:
+            self.proc_kxr_controller.kill()
+
+    def subscribe(self):
+        self.command_joint_state_sub = rospy.Subscriber(
+            self.base_namespace + "/command_joint_state",
+            JointState,
+            queue_size=1,
+            callback=self.command_joint_state_callback,
+        )
+        self.velocity_command_joint_state_sub = rospy.Subscriber(
+            self.base_namespace + "/velocity_command_joint_state",
+            JointState,
+            queue_size=1,
+            callback=self.velocity_command_joint_state_callback,
+        )
+
+    def unsubscribe(self):
+        self.command_joint_state_sub.unregister()
+        self.velocity_command_joint_state_sub.unregister()
+
+    def config_callback(self, config, level):
+        self.frame_count = config.frame_count
+        self.wheel_frame_count = config.wheel_frame_count
+        self.current_limit = config.current_limit
+        self.temperature_limit = config.temperature_limit
+        self._update_temperature_limit = True
+        self._update_current_limit = True
+        return config
+
+    def get_ids(self, type="servo", max_retries=10):
+        if type == "servo":
+            ids = serial_call_with_retry(
+                self.interface.search_servo_ids, max_retries=max_retries
+            )
+        elif type == "air_board":
+            ids = serial_call_with_retry(
+                self.interface.search_air_board_ids, max_retries=max_retries
+            )
+        if ids is None:
+            return
+        ids = ids.tolist()
+        return ids
+
+    def set_fullbody_controller(self):
+        self.fullbody_jointnames = []
+        for jn in self.joint_names:
+            if jn not in self.joint_name_to_id:
+                continue
+            servo_id = self.joint_name_to_id[jn]
+            if servo_id in self.interface.wheel_servo_sorted_ids:
+                continue
+            self.fullbody_jointnames.append(jn)
+        set_fullbody_controller(self.fullbody_jointnames)
+
+    def set_initial_positions(self):
+        initial_positions = {}
+        init_av = serial_call_with_retry(self.interface.angle_vector, max_retries=10)
+        if init_av is None:
+            return False
+        for jn in self.joint_names:
+            if jn not in self.joint_name_to_id:
+                continue
+            servo_id = self.joint_name_to_id[jn]
+            if servo_id in self.interface.wheel_servo_sorted_ids:
+                continue
+            idx = self.interface.servo_id_to_index(servo_id)
+            if idx is None:
+                continue
+            initial_positions[jn] = float(np.deg2rad(init_av[idx]))
+        set_initial_position(initial_positions, namespace=self.base_namespace)
+        return True
+
+    def _valid_joint(self, joint_name):
+        return joint_name in self.joint_name_to_id and (
+            self.joint_name_to_id[joint_name] in self.interface.servo_on_states_dict
+            and self.interface.servo_on_states_dict[self.joint_name_to_id[joint_name]]
+        )
+
+    def _msg_to_angle_vector_and_servo_ids(self, msg, velocity_control=False):
+        used_servo_id = {}
+        servo_ids = []
+        angle_vector = []
+        for name, angle in zip(msg.name, msg.position):
+            if not self._valid_joint(name):
+                continue
+            idx = self.joint_name_to_id[name]
+            if velocity_control:
+                if idx not in self.interface.wheel_servo_sorted_ids:
+                    continue
+            else:
+                if idx in self.interface.wheel_servo_sorted_ids:
+                    continue
+            # should ignore duplicated index.
+            if idx in used_servo_id:
+                continue
+            used_servo_id[idx] = True
+            angle_vector.append(np.rad2deg(angle))
+            servo_ids.append(idx)
+        angle_vector = np.array(angle_vector)
+        servo_ids = np.array(servo_ids, dtype=np.int32)
+        valid_indices = self.interface.valid_servo_ids(servo_ids)
+        return angle_vector[valid_indices], servo_ids[valid_indices]
+
+    def velocity_command_joint_state_callback(self, msg):
+        if not self.interface.is_opened() or self._during_servo_off:
+            return
+        av, servo_ids = self._msg_to_angle_vector_and_servo_ids(
+            msg, velocity_control=True
+        )
+        if len(av) == 0:
+            return
+        if not hasattr(self, "_prev_velocity_command"):
+            self._prev_velocity_command = None
+        if self._prev_velocity_command is not None and np.allclose(
+            self._prev_velocity_command, av
+        ):
+            return
+        ret = self.interface.angle_vector(av, servo_ids, velocity=self.wheel_frame_count)
+        if ret is None:
+            return
+        self._prev_velocity_command = av
+
+    def command_joint_state_callback(self, msg):
+        if not self.interface.is_opened() or self._during_servo_off:
+            return
+        av, servo_ids = self._msg_to_angle_vector_and_servo_ids(
+            msg, velocity_control=False
+        )
+        if len(av) == 0:
+            return
+        serial_call_with_retry(
+            self.interface.angle_vector, av, servo_ids, velocity=self.frame_count
+        )
+
+    def servo_on_off_callback(self, goal):
+        if not self.interface.is_opened():
+            return self.servo_on_off_server.set_aborted(
+                text="Failed to call servo on off. "
+                + "Control board is switch off or cable is disconnected?"
+            )
+
+        # Publish current joint position to follow_joint_trajectory
+        # to prevent sudden movements.
+        self.cancel_motion_pub.publish(GoalID())  # Ensure no active motion
+        rospy.sleep(0.1)  # Slight delay for smooth transition
+
+        servo_vector = []
+        servo_ids = []
+        for joint_name, servo_on in zip(goal.joint_names, goal.servo_on_states):
+            if joint_name not in self.joint_name_to_id:
+                continue
+            servo_ids.append(self.joint_name_to_id[joint_name])
+            if servo_on:
+                servo_vector.append(ServoOnOffValues.ON.value)
+            else:
+                servo_vector.append(ServoOnOffValues.OFF.value)
+
+        self._during_servo_off = True
+        ret = serial_call_with_retry(
+            self.interface.servo_angle_vector,
+            servo_ids,
+            servo_vector,
+            velocity=1,
+            max_retries=10,
+        )
+        if ret is None:
+            self._during_servo_off = False
+            return self.servo_on_off_server.set_aborted(
+                text="Failed to call servo on off. "
+                + "Control board is switch off or cable is disconnected?"
+            )
+
+        av = self.interface.angle_vector()
+        joint_names = []
+        positions = []
+        for joint_name in self.fullbody_jointnames:
+            angle = 0
+            if joint_name in self.joint_name_to_id:
+                servo_id = self.joint_name_to_id[joint_name]
+                idx = self.interface.servo_id_to_index(servo_id)
+                if idx is not None:
+                    angle = np.deg2rad(av[idx])
+            joint_names.append(joint_name)
+            positions.append(angle)
+        # Create JointTrajectoryGoal to set current position on follow_joint_trajectory
+        trajectory_goal = FollowJointTrajectoryGoal()
+        trajectory_goal.trajectory.joint_names = joint_names
+        point = JointTrajectoryPoint()
+        point.positions = positions
+        point.time_from_start = rospy.Duration(
+            0.5
+        )  # Short duration for immediate application
+        trajectory_goal.trajectory.points = [point]
+        # Initialize action client and wait for server
+        self.traj_action_client.send_goal(trajectory_goal)
+        self.traj_action_client.wait_for_result()  # Wait for trajectory to complete
+        self._during_servo_off = False
+        return self.servo_on_off_server.set_succeeded(ServoOnOffResult())
+
+    def adjust_angle_vector_callback(self, goal):
+        if not self.interface.is_opened():
+            return self.adjust_angle_vector_server.set_aborted(
+                text="Failed to adjust angle vector"
+            )
+        servo_ids = []
+        error_thresholds = []
+        for joint_name, error_threshold in zip(goal.joint_names, goal.error_threshold):
+            if not self._valid_joint(joint_name):
+                continue
+            servo_ids.append(self.joint_name_to_id[joint_name])
+            error_thresholds.append(error_threshold)
+        adjust = serial_call_with_retry(
+            self.interface.adjust_angle_vector,
+            servo_ids=servo_ids,
+            error_threshold=np.array(error_thresholds, dtype=np.float32),
+        )
+        if adjust is None:
+            return self.adjust_angle_vector_server.set_aborted(
+                text="Failed to adjust angle vector"
+            )
+        # If adjustment occurs, cancel motion via follow joint trajectory
+        if adjust is True:
+            self.cancel_motion_pub.publish(GoalID())
+            rospy.logwarn("Stop motion by sending follow joint trajectory cancel.")
+        return self.adjust_angle_vector_server.set_succeeded(AdjustAngleVectorResult())
+
+    def publish_stretch(self):
+        if not self.interface.is_opened():
+            return False
+        # Get current stretch of all servo motors and publish them
+        joint_names = []
+        servo_ids = []
+        for joint_name in self.joint_names:
+            if joint_name not in self.joint_name_to_id:
+                continue
+            joint_names.append(joint_name)
+            servo_ids.append(self.joint_name_to_id[joint_name])
+        stretch = serial_call_with_retry(self.interface.read_stretch)
+        if stretch is None:
+            return False
+        stretch_msg = Stretch(joint_names=joint_names, stretch=stretch)
+        self.stretch_publisher.publish(stretch_msg)
+        return True
+
+    def stretch_callback(self, goal):
+        if not self.interface.is_opened():
+            return self.stretch_server.set_aborted(text="Failed to update stretch")
+        if len(goal.joint_names) == 0:
+            goal.joint_names = self.joint_names
+        joint_names = []
+        servo_ids = []
+        for joint_name in goal.joint_names:
+            if joint_name not in self.joint_name_to_id:
+                continue
+            joint_names.append(joint_name)
+            servo_ids.append(self.joint_name_to_id[joint_name])
+        # Send new stretch
+        stretch = goal.stretch
+        success = serial_call_with_retry(
+            self.interface.send_stretch, value=stretch, servo_ids=servo_ids
+        )
+        if success is None:
+            return self.stretch_server.set_aborted(text="Failed to update stretch")
+        # need to wait for stretch value update.
+        rospy.sleep(1.0)
+        self.publish_stretch()
+        rospy.loginfo(f"Update {joint_names} stretch to {stretch}")
+        return self.stretch_server.set_succeeded(StretchResult())
+
+    def start_pump(self):
+        self.interface.open_relay_valve(self.pump_id)
+
+    def stop_pump(self):
+        self.interface.close_relay_valve(self.pump_id)
 
     def start_add_air(self, ids):
         if not isinstance(ids, list):
@@ -42,19 +734,19 @@ class UmoruArmController():
         for i in self.air_board_ids:
             if i not in ids:
                 self.interface.close_work_valve(i)
-            self.interface.open_relay_valve(i)
+            # self.interface.open_relay_valve(i)
         for i in ids:
             self.interface.open_work_valve(i)
-        self.interface.start_pump()
+        self.start_pump()
 
     def stop_add_air(self, ids):
         if not isinstance(ids, list):
             ids = [ids]
         for i in ids:
             self.interface.close_work_valve(i)
-        for i in self.air_board_ids:
-            self.interface.close_relay_valve(i)
-        self.interface.stop_pump()
+        # for i in self.air_board_ids:
+        #     self.interface.close_relay_valve(i)
+        self.stop_pump()
 
     def start_remove_air(self, ids):
         if not isinstance(ids, list):
@@ -62,7 +754,7 @@ class UmoruArmController():
         for i in self.air_board_ids:
             if i not in ids:
                 self.interface.close_work_valve(i)
-            self.interface.open_relay_valve(i)
+            # self.interface.open_relay_valve(i)
         for i in ids:
             self.interface.open_work_valve(i)
         self.interface.open_air_connect_valve()
@@ -73,20 +765,20 @@ class UmoruArmController():
         for i in ids:
             self.interface.close_work_valve(i)
         self.interface.close_air_connect_valve()
-        for i in self.air_board_ids:
-            self.interface.close_relay_valve(i)
+        # for i in self.air_board_ids:
+        #     self.interface.close_relay_valve(i)
 
     def refill(self, idx, threshold):
-        rospy.loginfo(f"[refill] {idx}")
-        start_time = time.time()
+        rospy.loginfo(f"[refill start] {idx}")
+        start_time = rospy.Time.now()
         self.start_add_air(idx)
         while True:
             pressure = self.read_pressure_sensor(idx)
             scaled_pressure = self.scaled_pressure(idx)
-            rospy.loginfo(f"[refill] {pressure}")
-            if scaled_pressure >= threshold or (time.time() - start_time) >= 4:
+            if scaled_pressure >= threshold or (rospy.Time.now() - start_time) >= rospy.Duration(4):
                 break
         self.stop_add_air(idx)
+        rospy.loginfo(f"[refill stop] {idx} pressure:{self.scaled_pressure(idx)}")
 
     def publish_pressure(self):
         for idx in self.air_board_ids:
@@ -96,17 +788,27 @@ class UmoruArmController():
                     self._scaled_pressure_publisher_dict[key] = rospy.Publisher(
                         '/scaled_pressure/'+key, std_msgs.msg.Float32,
                         queue_size=1)
+                    self._pressure_publisher_dict[key] = rospy.Publisher(
+                        self.base_namespace + "/fullbody_controller/pressure/" + key,
+                        std_msgs.msg.Float32,
+                        queue_size=1)
                     # Avoid 'rospy.exceptions.ROSException:
                     # publish() to a closed topic'
                     rospy.sleep(0.1)
                 pressure = self.read_pressure_sensor(idx)
-                scaled_pressure = self.scaled_pressure(idx)
-                if scaled_pressure is not None:
-                    self._scaled_pressure_publisher_dict[key].publish(
-                        std_msgs.msg.Float32(data=scaled_pressure))
-                    if self.control_pressure:
-                        if scaled_pressure > -8 and scaled_pressure < self.refill_lower_threshold:
-                            self.refill(idx, self.refill_upper_threshold)
+                if pressure is None:
+                    success = False
+                    continue
+                self._pressure_publisher_dict[key].publish(
+                    std_msgs.msg.Float32(data=pressure))
+                if self.calibrate_dict[key]:
+                    scaled_pressure = self.scaled_pressure(idx)
+                    if scaled_pressure is not None:
+                        self._scaled_pressure_publisher_dict[key].publish(
+                            std_msgs.msg.Float32(data=scaled_pressure))
+                        if self.control_positive_pressure:
+                            if scaled_pressure > -8 and scaled_pressure < self.refill_lower_threshold:
+                                self.refill(idx, self.refill_upper_threshold)
             except serial.serialutil.SerialException as e:
                 rospy.logerr('[publish_pressure] {}'.format(str(e)))
 
@@ -135,83 +837,167 @@ class UmoruArmController():
 
     def scaled_pressure(self, idx):
         return self.average_pressure(idx) - self.max_pressures[idx]
-        # # Get the current pressure and scale it using min and max pressures
-        # current_pressure = self.average_pressure(idx)
 
-        # if idx in self.min_pressures and idx in self.max_pressures:
-        #     min_pressure = self.min_pressures[idx]
-        #     max_pressure = self.max_pressures[idx]
+    def calibrate_sensor(self, req):
+        idx = req.idx
+        res = SensorCalibResponse()
+        if req.start:
+            rospy.loginfo(f"[Service] Start adding air to id:{idx}")
+            self.start_add_air(idx)
+            res.success = True
+        else:
+            rospy.loginfo(f"[Service] Stop adding air and measuring id:{idx}")
+            self.stop_add_air(idx)
+            for i in range(10):
+                self.read_pressure_sensor(idx)
+            max_pressure = self.average_pressure(idx)
+            self.max_pressures[idx] = max_pressure
+            rospy.loginfo(f"Sensor {idx} max pressure: {max_pressure}")
+            self.calibrate_dict[f'{idx}'] = True
+            res.max_pressure = max_pressure
+            res.success = True
+        return res
 
-        #     if max_pressure > min_pressure:  # Avoid division by zero
-        #         scaled_pressure = (current_pressure - min_pressure) / (max_pressure - min_pressure)
-        #         return scaled_pressure
-        #     else:
-        #         rospy.logwarn(f"[get_scaled_pressure] Invalid calibration range for sensor {idx}")
-        #         return None
-        # else:
-        #     # rospy.logwarn(f"[get_scaled_pressure] Calibration data not found for sensor {idx}")
-        #     return None
+    def publish_joint_states(self):
+        av = serial_call_with_retry(self.interface.angle_vector)
+        torque_vector = serial_call_with_retry(self.interface.servo_error)
+        if self.read_current:
+            currents = serial_call_with_retry(self.interface.read_servo_current)
+        else:
+            currents = None
+        if self.read_temperature:
+            temperatures = serial_call_with_retry(self.interface.read_servo_temperature)
+        else:
+            temperatures = None
+        if av is None or torque_vector is None:
+            return
+        msg = JointState()
+        msg.header.stamp = rospy.Time.now()
+        servos_msg = ServoStateArray()
+        servos_msg.header.stamp = msg.header.stamp
+        for name in self.joint_names:
+            if name in self.joint_name_to_id:
+                servo_id = self.joint_name_to_id[name]
+                idx = self.interface.servo_id_to_index(servo_id)
+                if idx is None:
+                    continue
+                position = np.deg2rad(av[idx])
+                effort = torque_vector[idx]
+                msg.position.append(position)
+                msg.effort.append(effort)
+                msg.name.append(name)
+                servo_state_msg = ServoState(
+                    header=msg.header,
+                    name=name,
+                    position=position,
+                    error=effort,
+                    temperature=temperatures)
+                if temperatures is not None and len(temperatures) > idx:
+                    servo_state_msg.temperature = temperatures[idx]
+                if currents is not None and len(currents) > idx:
+                    servo_state_msg.current = currents[idx]
+                servos_msg.servos.append(servo_state_msg)
+        self.current_joint_states_pub.publish(msg)
+        self.servo_states_pub.publish(servos_msg)
+        return True
 
-    def calibrate_sensor(self, idx):
-        rospy.loginfo(f"[calibrate_sensor] id:{idx}")
-        # # Step 1: Remove air to reach atmospheric pressure
-        # self.start_remove_air(idx)
-        # input("Press Enter to stop removing air...")
-        # self.stop_remove_air(idx)
+    def publish_servo_on_off(self):
+        if self.servo_on_off_pub.get_num_connections() == 0:
+            return
+        if not self.interface.is_opened():
+            return
 
-        # # Save the minimum pressure reading as atmospheric pressure
-        # for i in range(10):
-        #     self.read_pressure_sensor(idx)
-        # min_pressure = self.average_pressure(idx)
-        # if min_pressure > 40:
-        #     rospy.logwarn(f"Invalid calibration range for sensor {idx}")
-        #     return
-        # self.min_pressures[idx] = min_pressure
-        # rospy.loginfo(f"[calibrate_sensor] Sensor {idx} min pressure (atmospheric): {min_pressure}")
-
-        # Step 2: Add air for 8 seconds to reach maximum pressure
-        self.start_add_air(idx)
-        input("Press Enter to stop adding air...")
-        self.stop_add_air(idx)
-
-        # Save the maximum pressure reading
-        for i in range(10):
-            self.read_pressure_sensor(idx)
-        max_pressure = self.average_pressure(idx)
-        # if max_pressure <= min_pressure:
-        #     rospy.logwarn(f"Invalid calibration range for sensor {idx}")
-        #     return
-        self.max_pressures[idx] = max_pressure
-        rospy.loginfo(f"[calibrate_sensor] Sensor {idx} max pressure: {max_pressure}")
-
-    def callback(self, msg):
-        servo_ids = []
-        angle_vector = []
-        velocity_vector = []
-        for name, position, velocity in zip(msg.name, msg.position, msg.velocity):
-            if name not in self.joint_name_to_id:
+        servo_on_off_msg = ServoOnOff()
+        for jn in self.joint_names:
+            if jn not in self.joint_name_to_id:
                 continue
-            idx = self.joint_name_to_id[name]
-            servo_ids.append(idx)
-            angle_vector.append(position)
-            velocity_vector.append(velocity)
-            
-        angle_vector = np.array(angle_vector)
-        velocity_vector = np.array(velocity_vector)
-        servo_ids = np.array(servo_ids, dtype=np.int32)
-        self.interface.angle_vector(angle_vector, servo_ids, velocity_vector)
+            idx = self.joint_name_to_id[jn]
+            if idx not in self.interface.servo_on_states_dict:
+                continue
+            servo_on_off_msg.joint_names.append(jn)
+            servo_state = self.interface.servo_on_states_dict[idx]
+            servo_on_off_msg.servo_on_states.append(servo_state)
+        self.servo_on_off_pub.publish(servo_on_off_msg)
+
+    def reinitialize_interface(self):
+        rospy.loginfo("Reinitialize interface.")
+        self.unsubscribe()
+        self.interface.close()
+        self.interface = self.setup_interface()
+        if self.read_current:
+            serial_call_with_retry(self.interface.switch_reading_servo_crreunt, enable=True, max_retries=3)
+        if self.read_temperature:
+            serial_call_with_retry(self.interface.switch_reading_servo_temperature, enable=True, max_retries=3)
+        self.subscribe()
+        rospy.loginfo("Successfully reinitialized interface.")
+
+    def check_success_rate(self):
+        # Calculate success rate
+        if self.publish_joint_states_attempts > 0:
+            success_rate = (
+                self.publish_joint_states_successes / self.publish_joint_states_attempts
+            )
+
+            # Check if the success rate is below the threshold
+            if success_rate < self.success_rate_threshold:
+                rospy.logwarn(
+                    f"communication success rate ({success_rate:.2%}) below threshold; "
+                    + "reinitializing interface."
+                )
+                self.reinitialize_interface()
+
+        # Reset counters and timer
+        self.publish_joint_states_successes = 0
+        self.publish_joint_states_attempts = 0
+        self.last_check_time = rospy.Time.now()
 
     def run(self):
-        rate = rospy.Rate(20)
+        rate = rospy.Rate(rospy.get_param(self.base_namespace + "/control_loop_rate", 20))
+
+        self.publish_joint_states_attempts = 0
+        self.publish_joint_states_successes = 0
+        self.last_check_time = rospy.Time.now()
+        check_board_communication_interval = rospy.get_param(
+            "~check_board_communication_interval", 2
+        )
+        self.success_rate_threshold = 0.8  # Minimum success rate required
+
         while not rospy.is_shutdown():
-            if self.interface.is_opened() is False:
-                self.unsubscribe()
-                rospy.signal_shutdown('Disconnected.')
-                break
+            if self._update_current_limit:
+                ret = serial_call_with_retry(self.interface.send_current_limit,
+                                             self.current_limit, max_retries=3)
+                if ret is not None:
+                    rospy.loginfo(f"Current limit set {self.current_limit}")
+                    self._update_current_limit = False
+                else:
+                    rospy.logwarn("Could not set current limit")
+            if self._update_temperature_limit:
+                ret = serial_call_with_retry(self.interface.send_temperature_limit,
+                                       self.temperature_limit, max_retries=3)
+                if ret is not None:
+                    rospy.loginfo(f"Temperature limit set {self.temperature_limit}")
+                    self._update_temperature_limit = False
+                else:
+                    rospy.logwarn("Could not set temperature limit")
+
+            success = self.publish_joint_states()
+            self.publish_joint_states_attempts += 1
+            if success:
+                self.publish_joint_states_successes += 1
+
+            # Check success rate periodically
+            current_time = rospy.Time.now()
+            if (
+                current_time - self.last_check_time
+            ).to_sec() >= check_board_communication_interval:
+                self.check_success_rate()
+
+            self.publish_servo_on_off()
             self.publish_pressure()
             rate.sleep()
 
-if __name__ == '__main__':
-    rospy.init_node('umoru_arm_controller')
-    umoru_arm_controller = UmoruArmController()
-    umoru_arm_controller.run()
+
+if __name__ == "__main__":
+    rospy.init_node("rcb4_ros_bridge")
+    ros_bridge = RCB4ROSBridge()
+    ros_bridge.run()

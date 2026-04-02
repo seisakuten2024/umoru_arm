@@ -4,13 +4,19 @@
   <arg name="urdf_path" default="" />
   <arg name="servo_config_path" default="$(find umoru_arm)/config/rarm_servo_config.yaml" />
   
-  <include file="$(find kxr_controller)/launch/kxr_controller.launch" >
-    <arg name="servo_config_path" value="$(arg servo_config_path)" />
-    <arg name="device" value="$(arg device)" />
-    <arg name="publish_imu" value="false" />
-    <arg name="namespace" value="$(arg namespace)" />
-    <arg name="urdf_path" value="" />
-    <arg name="model_server_port" default="8124" />    
-  </include>
+  <group ns ="$(arg namespace)" >
+    <node
+        name="umoru_rarm_controller"
+        pkg="umoru_arm"
+        type="umoru_arm_controller.py"
+        output="screen">
+      <param name="device" type="str" value="$(arg device)" />
+      <param name="urdf_path" type="str" value="$(arg urdf_path)"
+             if="$(eval len(arg('urdf_path')) > 0)"/>
+      <rosparam subst_value="true" >
+        servo_config_path: $(arg servo_config_path)
+      </rosparam>
+    </node>
+  </group>
   
 </launch>

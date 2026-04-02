@@ -1,0 +1,12 @@
+<launch>
+  <arg name="rosbag" doc="rosbag file path" />
+
+  <node name="rosbag_record" pkg="rosbag" type="record"
+      args="-O $(arg rosbag)
+          /rosout
+          --regex
+          (.*)follow_joint_trajectory/goal
+          (.*)pressure(.*)
+          (.*)joint_states"
+      output="screen" />
+</launch>

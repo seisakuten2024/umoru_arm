@@ -1,11 +1,4 @@
 <launch>
-  <arg name="arm" default="rarm"/>
-  <arg name="device" default="" />
-  <node
-      name="umoru_$(arg arm)_controller"
-      pkg="umoru_arm"
-      type="umoru_arm_controller.py"
-      output="screen">
-    <param name="device" type="str" value="$(arg device)" />
-  </node>
+  <include file="$(find umoru_arm)/launch/umoru_rarm.launch" />
+  <include file="$(find umoru_arm)/launch/umoru_larm.launch" />
 </launch>
