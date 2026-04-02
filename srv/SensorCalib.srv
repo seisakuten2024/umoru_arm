@@ -1,0 +1,6 @@
+int32 idx      # センサーID
+bool start     # Trueなら開始、Falseなら停止・計測
+---
+# レスポンス
+bool success
+float64 max_pressure
